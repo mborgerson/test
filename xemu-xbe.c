@@ -1,4 +1,4 @@
-/*
+ /*
  * xemu XBE accessing
  *
  * Helper functions to get details about the currently running executable.
