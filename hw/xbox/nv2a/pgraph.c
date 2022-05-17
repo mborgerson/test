@@ -290,11 +290,11 @@ static const ColorFormatInfo kelvin_color_format_map[66] = {
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R6G5B5] =
         {2, false, GL_RGB8_SNORM, GL_RGB, GL_BYTE}, /* FIXME: This might be signed */
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8] =
-        {2, false, GL_RG8_SNORM, GL_RG, GL_BYTE, /* FIXME: This might be signed */
-         {GL_ONE, GL_GREEN, GL_RED, GL_ONE}},
+        {2, false, GL_RG8, GL_RG, GL_UNSIGNED_BYTE,
+         {GL_RED, GL_GREEN, GL_RED, GL_GREEN}},
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8] =
-        {2, false, GL_RG8_SNORM, GL_RG, GL_BYTE, /* FIXME: This might be signed */
-         {GL_GREEN, GL_ONE, GL_RED, GL_ONE}},
+        {2, false, GL_RG8, GL_RG, GL_UNSIGNED_BYTE,
+         {GL_GREEN, GL_RED, GL_RED, GL_GREEN}},
 
     [NV097_SET_TEXTURE_FORMAT_COLOR_LC_IMAGE_CR8YB8CB8YA8] =
         {2, true, GL_RGBA8,  GL_RGBA, GL_UNSIGNED_INT_8_8_8_8_REV},
@@ -896,14 +896,14 @@ static void pgraph_image_blit(NV2AState *d)
     uint8_t *dest_row = dest + dest_offset;
 
     if (image_blit->operation == NV09F_SET_OPERATION_SRCCOPY) {
-        NV2A_GL_DPRINTF(true, "NV09F_SET_OPERATION_SRCCOPY");
+        NV2A_GL_DPRINTF(false, "NV09F_SET_OPERATION_SRCCOPY");
         for (unsigned int y = 0; y < image_blit->height; y++) {
             memmove(dest_row, source_row, image_blit->width * bytes_per_pixel);
             source_row += context_surfaces->source_pitch;
             dest_row += context_surfaces->dest_pitch;
         }
     } else if (image_blit->operation == NV09F_SET_OPERATION_BLEND_AND) {
-        NV2A_GL_DPRINTF(true, "NV09F_SET_OPERATION_BLEND_AND");
+        NV2A_GL_DPRINTF(false, "NV09F_SET_OPERATION_BLEND_AND");
         uint32_t max_beta_mult = 0x7f80;
         uint32_t beta_mult = beta->beta >> 16;
         uint32_t inv_beta_mult = max_beta_mult - beta_mult;
@@ -1507,13 +1507,17 @@ DEF_METHOD(NV097, SET_WINDOW_CLIP_TYPE)
 DEF_METHOD_INC(NV097, SET_WINDOW_CLIP_HORIZONTAL)
 {
     int slot = (method - NV097_SET_WINDOW_CLIP_HORIZONTAL) / 4;
-    pg->regs[NV_PGRAPH_WINDOWCLIPX0 + slot * 4] = parameter;
+    for (; slot < 8; ++slot) {
+        pg->regs[NV_PGRAPH_WINDOWCLIPX0 + slot * 4] = parameter;
+    }
 }
 
 DEF_METHOD_INC(NV097, SET_WINDOW_CLIP_VERTICAL)
 {
     int slot = (method - NV097_SET_WINDOW_CLIP_VERTICAL) / 4;
-    pg->regs[NV_PGRAPH_WINDOWCLIPY0 + slot * 4] = parameter;
+    for (; slot < 8; ++slot) {
+        pg->regs[NV_PGRAPH_WINDOWCLIPY0 + slot * 4] = parameter;
+    }
 }
 
 DEF_METHOD(NV097, SET_ALPHA_TEST_ENABLE)
@@ -3707,9 +3711,7 @@ void nv2a_set_surface_scale_factor(unsigned int scale)
 {
     NV2AState *d = g_nv2a;
 
-    xemu_settings_set_int(XEMU_SETTINGS_DISPLAY_RENDER_SCALE,
-                          scale < 1 ? 1 : scale);
-    xemu_settings_save();
+    g_config.display.quality.surface_scale = scale < 1 ? 1 : scale;
 
     qemu_mutex_unlock_iothread();
 
@@ -3750,8 +3752,7 @@ unsigned int nv2a_get_surface_scale_factor(void)
 
 static void pgraph_reload_surface_scale_factor(NV2AState *d)
 {
-    int factor;
-    xemu_settings_get_int(XEMU_SETTINGS_DISPLAY_RENDER_SCALE, &factor);
+    int factor = g_config.display.quality.surface_scale;
     d->pgraph.surface_scale_factor = factor < 1 ? 1 : factor;
 }
 
@@ -4078,6 +4079,7 @@ static void pgraph_shader_update_constants(PGRAPHState *pg,
     }
 
     /* Clipping regions */
+    int max_gl_height = pg->surface_binding_dim.height - 1;
     for (i = 0; i < 8; i++) {
         uint32_t x = pg->regs[NV_PGRAPH_WINDOWCLIPX0 + i * 4];
         unsigned int x_min = GET_MASK(x, NV_PGRAPH_WINDOWCLIPX0_XMIN);
@@ -4089,9 +4091,9 @@ static void pgraph_shader_update_constants(PGRAPHState *pg,
         pgraph_apply_anti_aliasing_factor(pg, &x_max, &y_max);
 
         /* Translate for the GL viewport origin */
-        unsigned int y_min_xlat = MAX(pg->surface_binding_dim.height - y_max - 1, 0);
-        unsigned int y_max_xlat = MIN(pg->surface_binding_dim.height - y_min - 1,
-                                      pg->surface_binding_dim.height);
+        unsigned int y_min_xlat = MAX(max_gl_height - (int)y_max, 0);
+        unsigned int y_max_xlat = MIN(max_gl_height - (int)y_min, max_gl_height);
+
         pgraph_apply_scaling_factor(pg, &x_min, &y_min_xlat);
         pgraph_apply_scaling_factor(pg, &x_max, &y_max_xlat);
 
@@ -4772,14 +4774,15 @@ static void pgraph_init_display_renderer(NV2AState *d)
         "    texCoord.y = 1 + rel*(texCoord.y - 1);"
         "    out_Color.rgba = texture(tex, texCoord);\n"
         "    if (pvideo_enable) {\n"
+        "        vec2 screenCoord = gl_FragCoord.xy - 0.5;\n"
         "        vec4 extent = vec4(pvideo_pos.xy, pvideo_pos.xy + pvideo_pos.zw);\n"
-        "        bvec4 clip = bvec4(lessThan(gl_FragCoord.xy, extent.xy),\n"
-        "                           greaterThan(gl_FragCoord.xy, extent.zw));\n"
+        "        bvec4 clip = bvec4(lessThan(screenCoord, extent.xy),\n"
+        "                           greaterThan(screenCoord, extent.zw));\n"
         "        if (!any(clip)) {\n"
-        "            vec2 spos = vec2(gl_FragCoord.x, textureSize(tex,0).y-gl_FragCoord.y);\n"
-        "            vec2 coord = (spos-pvideo_pos.xy)/pvideo_pos.zw;\n"
+        "            vec2 videoCoord = (screenCoord - pvideo_pos.xy) / pvideo_pos.zw;\n"
+        "            videoCoord.y *= -1.0;\n"
         "            if (!pvideo_color_key_enable || out_Color.rgba == pvideo_color_key) {\n"
-        "               out_Color.rgba = texture(pvideo_tex, coord);\n"
+        "               out_Color.rgba = texture(pvideo_tex, videoCoord);\n"
         "            }\n"
         "        }\n"
         "    }\n"
@@ -4888,6 +4891,9 @@ static void pgraph_render_display_pvideo_overlay(NV2AState *d)
     pgraph_apply_scaling_factor(pg, &out_x, &out_y);
     pgraph_apply_scaling_factor(pg, &out_width, &out_height);
 
+    // Translate for the GL viewport origin.
+    out_y = MAX(pg->gl_display_buffer_height - 1 - (int)(out_y + out_height), 0);
+
     glActiveTexture(GL_TEXTURE0 + 1);
     glBindTexture(GL_TEXTURE_2D, g_nv2a->pgraph.disp_rndr.pvideo_tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
@@ -4912,6 +4918,11 @@ static void pgraph_render_display(NV2AState *d, SurfaceBinding *surface)
     d->vga.get_resolution(&d->vga, (int*)&width, (int*)&height);
     d->vga.get_offsets(&d->vga, &pline_offset, &pstart_addr, &pline_compare);
     int line_offset = surface->pitch / pline_offset;
+
+    /* Adjust viewport height for interlaced mode, used only in 1080i */
+    if (d->vga.cr[NV_PRMCIO_INTERLACE_MODE] != NV_PRMCIO_INTERLACE_MODE_DISABLED) {
+        height *= 2;
+    }
 
     pgraph_apply_scaling_factor(pg, &width, &height);
 
@@ -5924,9 +5935,9 @@ static void pgraph_update_surface(NV2AState *d, bool upload,
     pg->surface_shape.z_format = GET_MASK(pg->regs[NV_PGRAPH_SETUPRASTER],
                                           NV_PGRAPH_SETUPRASTER_Z_FORMAT);
 
-    /* FIXME: Does this apply to CLEARs too? */
-    color_write = color_write && pgraph_color_write_enabled(pg);
-    zeta_write = zeta_write && pgraph_zeta_write_enabled(pg);
+    color_write = color_write &&
+            (pg->clearing || pgraph_color_write_enabled(pg));
+    zeta_write = zeta_write && (pg->clearing || pgraph_zeta_write_enabled(pg));
 
     if (upload) {
         bool fb_dirty = pgraph_framebuffer_dirty(pg);
@@ -6316,7 +6327,11 @@ static void pgraph_bind_textures(NV2AState *d)
         SurfaceBinding *surface = pgraph_surface_get(d, texture_vram_offset);
         if (surface != NULL) {
             surf_to_tex = pgraph_check_surface_to_texture_compatibility(
-                surface, &state);
+                    surface, &state);
+
+            if (surf_to_tex && surface->upload_pending) {
+                pgraph_upload_surface_data(d, surface, false);
+            }
         }
 
         if (!surf_to_tex) {
@@ -6662,17 +6677,6 @@ static void pgraph_bind_vertex_attributes(NV2AState *d,
             updated_memory_buffer = true;
         }
 
-        if (attr->needs_conversion) {
-            glVertexAttribIPointer(i, attr->gl_count, attr->gl_type, stride,
-                                   (void *)attrib_data_addr);
-        } else {
-            glVertexAttribPointer(i, attr->gl_count, attr->gl_type,
-                                  attr->gl_normalize, stride,
-                                  (void *)attrib_data_addr);
-        }
-
-        glEnableVertexAttribArray(i);
-
         uint32_t provoking_element_index = provoking_element - min_element;
         size_t element_size = attr->size * attr->count;
         assert(element_size <= sizeof(attr->inline_value));
@@ -6683,12 +6687,26 @@ static void pgraph_bind_vertex_attributes(NV2AState *d,
         } else {
             last_entry = d->vram_ptr + start;
         }
-        if (stride) {
-            last_entry += stride * provoking_element_index;
-        } else {
-            last_entry += element_size * provoking_element_index;
+        if (!stride) {
+            // Stride of 0 indicates that only the first element should be
+            // used.
+            pgraph_update_inline_value(attr, last_entry);
+            glDisableVertexAttribArray(i);
+            glVertexAttrib4fv(i, attr->inline_value);
+            continue;
         }
 
+        if (attr->needs_conversion) {
+            glVertexAttribIPointer(i, attr->gl_count, attr->gl_type, stride,
+                                   (void *)attrib_data_addr);
+        } else {
+            glVertexAttribPointer(i, attr->gl_count, attr->gl_type,
+                                  attr->gl_normalize, stride,
+                                  (void *)attrib_data_addr);
+        }
+
+        glEnableVertexAttribArray(i);
+        last_entry += stride * provoking_element_index;
         pgraph_update_inline_value(attr, last_entry);
     }
 

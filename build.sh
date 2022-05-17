@@ -186,9 +186,12 @@ case "$platform" in # Adjust compilation options based on platform
         sdk_macos_11_1="${sdk_base}/MacOSX11.1.sdk"
         sdk_macos_11_3="${sdk_base}/MacOSX11.3.sdk"
         sdk_macos_12_0="${sdk_base}/MacOSX12.0.sdk"
+        sdk_macos_12_1="${sdk_base}/MacOSX12.1.sdk"
         if [ "$target_arch" == "arm64" ]; then
             macos_min_ver=11.3
-            if test -d "$sdk_macos_12_0"; then
+            if test -d "$sdk_macos_12_1"; then
+                sdk="$sdk_macos_12_1"
+            elif test -d "$sdk_macos_12_0"; then
                 sdk="$sdk_macos_12_0"
             elif test -d "$sdk_macos_11_3"; then
                 sdk="$sdk_macos_11_3"
@@ -198,7 +201,9 @@ case "$platform" in # Adjust compilation options based on platform
             fi
         elif [ "$target_arch" == "x86_64" ]; then
             macos_min_ver=10.13
-            if test -d "$sdk_macos_12_0"; then
+            if test -d "$sdk_macos_12_1"; then
+                sdk="$sdk_macos_12_1"
+            elif test -d "$sdk_macos_12_0"; then
                 sdk="$sdk_macos_12_0"
             elif test -d "$sdk_macos_11_3"; then
                 sdk="$sdk_macos_11_3"
@@ -257,7 +262,6 @@ esac
 
 # find absolute path (and resolve symlinks) to build out of tree
 configure="${project_source_dir}/configure"
-build_cflags="${build_cflags} -I${project_source_dir}/ui/imgui"
 
 set -x # Print commands from now on
 
@@ -267,11 +271,6 @@ set -x # Print commands from now on
     --target-list=i386-softmmu \
     ${opts} \
     "$@"
-
-# Force imgui update now to work around annoying make issue
-if ! test -f "${project_source_dir}/ui/imgui/imgui.cpp"; then
-    ./scripts/git-submodule.sh update ui/imgui
-fi
 
 time make -j"${job_count}" ${target} 2>&1 | tee build.log
 

@@ -242,6 +242,8 @@ static bool ilu_force_scalar[] = {
     false,
 };
 
+#define OUTPUT_REG_FOG 5
+
 static const char* out_reg_name[] = {
     "oPos",
     "???",
@@ -388,17 +390,23 @@ static MString* decode_opcode(const uint32_t *shader_token,
                               VshOutputMux out_mux,
                               uint32_t mask,
                               const char *opcode,
-                              const char *inputs)
+                              const char *inputs,
+                              uint32_t *fog_write_mask_idx,
+                              MString** suffix)
 {
+    *fog_write_mask_idx = 0;
     MString *ret = mstring_new();
     int reg_num = vsh_get_field(shader_token, FLD_OUT_R);
+    bool use_temp_var = false;
 
     /* Test for paired opcodes (in other words : Are both <> NOP?) */
     if (out_mux == OMUX_MAC
-          &&  vsh_get_field(shader_token, FLD_ILU) != ILU_NOP
-          && reg_num == 1) {
-        /* Ignore paired MAC opcodes that write to R1 */
-        mask = 0;
+          && vsh_get_field(shader_token, FLD_ILU) != ILU_NOP) {
+        use_temp_var = true;
+        if (reg_num == 1) {
+            /* Ignore paired MAC opcodes that write to R1 */
+            mask = 0;
+        }
     } else if (out_mux == OMUX_ILU
                && vsh_get_field(shader_token, FLD_MAC) != MAC_NOP) {
         /* Paired ILU opcodes can only write to R1 */
@@ -414,6 +422,7 @@ static MString* decode_opcode(const uint32_t *shader_token,
         mstring_append(ret, opcode);
         mstring_append(ret, "(");
 
+        bool write_fog_register = false;
         if (vsh_get_field(shader_token, FLD_OUT_ORB) == OUTPUT_C) {
             /* TODO : Emulate writeable const registers */
             mstring_append(ret, "c");
@@ -421,31 +430,72 @@ static MString* decode_opcode(const uint32_t *shader_token,
                 convert_c_register(
                     vsh_get_field(shader_token, FLD_OUT_ADDRESS)));
         } else {
-            mstring_append(ret,
-                out_reg_name[
-                    vsh_get_field(shader_token, FLD_OUT_ADDRESS) & 0xF]);
+            int out_reg = vsh_get_field(shader_token, FLD_OUT_ADDRESS) & 0xF;
+            mstring_append(ret,out_reg_name[out_reg]);
+            write_fog_register = out_reg == OUTPUT_REG_FOG;
         }
-        mstring_append(ret,
-            mask_str[
-                vsh_get_field(shader_token, FLD_OUT_O_MASK)]);
+
+        int write_mask = vsh_get_field(shader_token, FLD_OUT_O_MASK);
+        mstring_append(ret, mask_str[write_mask]);
         mstring_append(ret, inputs);
         mstring_append(ret, ");\n");
+
+        if (write_fog_register) {
+            if (write_mask & 0x08) {
+                *fog_write_mask_idx = 8;
+            } else if (write_mask & 0x04) {
+                *fog_write_mask_idx = 4;
+            } else if (write_mask & 0x02) {
+                *fog_write_mask_idx = 2;
+            } else if (write_mask & 0x01) {
+                *fog_write_mask_idx = 1;
+            } else {
+                // TODO: Verify the behavior of a 0-mask.
+                *fog_write_mask_idx = 8;
+            }
+        }
     }
 
-    if (strcmp(opcode, mac_opcode[MAC_ARL]) == 0) {
-        mstring_append_fmt(ret, "  ARL(A0%s);\n", inputs);
-    } else if (mask > 0) {
-        mstring_append_fmt(ret, "  %s(R%d%s%s);\n",
-                           opcode, reg_num, mask_str[mask], inputs);
+    if (use_temp_var) {
+        assert(suffix && "Temp var flagged on non-MAC instruction");
+        *suffix = mstring_new();
+        if (strcmp(opcode, mac_opcode[MAC_ARL]) == 0) {
+            mstring_append_fmt(ret, "  ARL(_temp_addr%s);\n", inputs);
+            mstring_append(*suffix, "  A0 = _temp_addr;\n");
+        } else if (mask > 0) {
+            mstring_append_fmt(ret, "  %s(_temp_vec%s%s);\n",
+                               opcode, mask_str[mask], inputs);
+
+            // Skip the leading comma
+            const char *mask_components = &mask_str[mask][1];
+            if (mask_components[0]) {
+                mstring_append_fmt(*suffix,
+                                   "  R%d.%s = _temp_vec.%s;\n",
+                                   reg_num,
+                                   mask_components,
+                                   mask_components);
+            } else {
+                mstring_append_fmt(*suffix, "  R%d = _temp_vec;\n", reg_num);
+            }
+        }
+    } else {
+        if (strcmp(opcode, mac_opcode[MAC_ARL]) == 0) {
+            mstring_append_fmt(ret, "  ARL(A0%s);\n", inputs);
+        } else if (mask > 0) {
+            mstring_append_fmt(ret, "  %s(R%d%s%s);\n",
+                               opcode, reg_num, mask_str[mask], inputs);
+        }
     }
 
     return ret;
 }
 
 
-static MString* decode_token(const uint32_t *shader_token)
+static MString* decode_token(const uint32_t *shader_token,
+                             uint32_t *fog_write_mask_idx)
 {
     MString *ret;
+    *fog_write_mask_idx = 0;
 
     /* See what MAC opcode is written to (if not masked away): */
     VshMAC mac = vsh_get_field(shader_token, FLD_MAC);
@@ -463,6 +513,7 @@ static MString* decode_token(const uint32_t *shader_token)
                             (vsh_get_field(shader_token, FLD_C_R_HIGH) << 2)
                                 | vsh_get_field(shader_token, FLD_C_R_LOW));
 
+    MString *mac_suffix = NULL;
     if (mac != MAC_NOP) {
         MString *inputs_mac = mstring_new();
         if (mac_opcode_params[mac].A) {
@@ -495,7 +546,9 @@ static MString* decode_token(const uint32_t *shader_token)
                             OMUX_MAC,
                             vsh_get_field(shader_token, FLD_OUT_MAC_MASK),
                             mac_opcode[mac],
-                            mstring_get_str(inputs_mac));
+                            mstring_get_str(inputs_mac),
+                            fog_write_mask_idx,
+                            &mac_suffix);
         mstring_unref(inputs_mac);
     } else {
         ret = mstring_new();
@@ -511,7 +564,9 @@ static MString* decode_token(const uint32_t *shader_token)
                           OMUX_ILU,
                           vsh_get_field(shader_token, FLD_OUT_ILU_MASK),
                           ilu_opcode[ilu],
-                          mstring_get_str(inputs_c));
+                          mstring_get_str(inputs_c),
+                          fog_write_mask_idx,
+                          NULL);
 
         mstring_append(ret, mstring_get_str(ilu_op));
 
@@ -520,6 +575,11 @@ static MString* decode_token(const uint32_t *shader_token)
     }
 
     mstring_unref(input_c);
+
+    if (mac_suffix) {
+        mstring_append(ret, mstring_get_str(mac_suffix));
+        mstring_unref(mac_suffix);
+    }
 
     return ret;
 }
@@ -542,6 +602,10 @@ static const char* vsh_header =
     "vec4 R11 = vec4(0.0,0.0,0.0,0.0);\n"
     "#define R12 oPos\n" /* R12 is a mirror of oPos */
     "\n"
+
+    /* Used to emulate concurrency of paired MAC+ILU instructions */
+    "vec4 _temp_vec;\n"
+    "int _temp_addr;\n"
 
     /* See:
      * http://msdn.microsoft.com/en-us/library/windows/desktop/bb174703%28v=vs.85%29.aspx
@@ -730,9 +794,14 @@ void vsh_translate(uint16_t version,
 
     bool has_final = false;
     int slot;
+
+    uint32_t max_fog_write_mask_idx = 0;
     for (slot=0; slot < length; slot++) {
         const uint32_t* cur_token = &tokens[slot * VSH_TOKEN_SIZE];
-        MString *token_str = decode_token(cur_token);
+        uint32_t fog_write_mask_idx;
+        MString *token_str = decode_token(cur_token, &fog_write_mask_idx);
+        max_fog_write_mask_idx = MAX(max_fog_write_mask_idx,
+                                     fog_write_mask_idx);
         mstring_append_fmt(body,
                            "  /* Slot %d: 0x%08X 0x%08X 0x%08X 0x%08X */",
                            slot,
@@ -748,6 +817,13 @@ void vsh_translate(uint16_t version,
         }
     }
     assert(has_final);
+
+    /* patch up oFog.x to mimic observed hardware behavior */
+    if (max_fog_write_mask_idx && max_fog_write_mask_idx != 8) {
+        // Skip the leading comma
+        const char *mask = &mask_str[max_fog_write_mask_idx][1];
+        mstring_append_fmt(body, "  oFog.x = oFog.%s;\n", mask);
+    }
 
     /* pre-divide and output the generated W so we can do persepctive correct
      * interpolation manually. OpenGL can't, since we give it a W of 1 to work

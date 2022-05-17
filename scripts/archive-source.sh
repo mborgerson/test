@@ -28,7 +28,7 @@ sub_file="${sub_tdir}/submodule.tar"
 # different to the host OS.
 submodules="dtc slirp meson ui/keycodemapdb"
 submodules="$submodules tests/fp/berkeley-softfloat-3 tests/fp/berkeley-testfloat-3"
-submodules="$submodules ui/imgui ui/implot util/xxHash" # xemu extras
+submodules="$submodules ui/thirdparty/imgui ui/thirdparty/implot util/xxHash tomlplusplus genconfig" # xemu extras
 sub_deinit=""
 
 function cleanup() {
@@ -76,7 +76,7 @@ done
 
 git rev-parse HEAD 2>/dev/null | tr -d '\n' > XEMU_COMMIT
 git symbolic-ref --short HEAD > XEMU_BRANCH
-git describe --tags --match 'xemu-v*' | cut -c 7- | tr -d '\n' > XEMU_VERSION
+git describe --tags --match 'v*' | cut -c 2- | tr -d '\n' > XEMU_VERSION
 tar -r --file "$tar_file" XEMU_COMMIT XEMU_BRANCH XEMU_VERSION
 
 exit 0

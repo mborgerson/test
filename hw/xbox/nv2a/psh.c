@@ -290,7 +290,17 @@ static MString* get_var(struct PixelShader *ps, int reg, bool is_dest)
         return mstring_from_str("r1");
     case PS_REGISTER_V1R0_SUM:
         add_var_ref(ps, "r0");
-        return mstring_from_str("vec4(v1.rgb + r0.rgb, 0.0)");
+        if (ps->final_input.clamp_sum) {
+            return mstring_from_fmt(
+                    "clamp(vec4(%s.rgb + %s.rgb, 0.0), 0.0, 1.0)",
+                    ps->final_input.inv_v1 ? "(1.0 - v1)" : "v1",
+                    ps->final_input.inv_r0 ? "(1.0 - r0)" : "r0");
+        } else {
+            return mstring_from_fmt(
+                    "vec4(%s.rgb + %s.rgb, 0.0)",
+                    ps->final_input.inv_v1 ? "(1.0 - v1)" : "v1",
+                    ps->final_input.inv_r0 ? "(1.0 - r0)" : "r0");
+        }
     case PS_REGISTER_EF_PROD:
         return mstring_from_fmt("vec4(%s * %s, 0.0)",
                                 mstring_get_str(ps->varE),
@@ -436,11 +446,16 @@ static void add_stage_code(struct PixelShader *ps,
     MString *cd_mapping = get_output(cd, output.mapping);
     MString *ab_dest = get_var(ps, output.ab, true);
     MString *cd_dest = get_var(ps, output.cd, true);
-    MString *sum_dest = get_var(ps, output.muxsum, true);
+    MString *muxsum_dest = get_var(ps, output.muxsum, true);
+
+    bool assign_ab = false;
+    bool assign_cd = false;
+    bool assign_muxsum = false;
 
     if (mstring_get_length(ab_dest)) {
-        mstring_append_fmt(ps->code, "%s.%s = clamp(%s(%s), -1.0, 1.0);\n",
-                           mstring_get_str(ab_dest), write_mask, caster, mstring_get_str(ab_mapping));
+        mstring_append_fmt(ps->code, "ab.%s = clamp(%s(%s), -1.0, 1.0);\n",
+                           write_mask, caster, mstring_get_str(ab_mapping));
+        assign_ab = true;
     } else {
         mstring_unref(ab_dest);
         mstring_ref(ab_mapping);
@@ -448,35 +463,56 @@ static void add_stage_code(struct PixelShader *ps,
     }
 
     if (mstring_get_length(cd_dest)) {
-        mstring_append_fmt(ps->code, "%s.%s = clamp(%s(%s), -1.0, 1.0);\n",
-                           mstring_get_str(cd_dest), write_mask, caster, mstring_get_str(cd_mapping));
+        mstring_append_fmt(ps->code, "cd.%s = clamp(%s(%s), -1.0, 1.0);\n",
+                           write_mask, caster, mstring_get_str(cd_mapping));
+        assign_cd = true;
     } else {
         mstring_unref(cd_dest);
         mstring_ref(cd_mapping);
         cd_dest = cd_mapping;
     }
 
-    if (!is_alpha && output.flags & PS_COMBINEROUTPUT_AB_BLUE_TO_ALPHA) {
-        mstring_append_fmt(ps->code, "%s.a = %s.b;\n",
-                           mstring_get_str(ab_dest), mstring_get_str(ab_dest));
-    }
-    if (!is_alpha && output.flags & PS_COMBINEROUTPUT_CD_BLUE_TO_ALPHA) {
-        mstring_append_fmt(ps->code, "%s.a = %s.b;\n",
-                           mstring_get_str(cd_dest), mstring_get_str(cd_dest));
-    }
-
-    MString *sum;
+    MString *muxsum;
     if (output.muxsum_op == PS_COMBINEROUTPUT_AB_CD_SUM) {
-        sum = mstring_from_fmt("(%s + %s)", mstring_get_str(ab), mstring_get_str(cd));
+        muxsum = mstring_from_fmt("(%s + %s)", mstring_get_str(ab),
+                                  mstring_get_str(cd));
     } else {
-        sum = mstring_from_fmt("((r0.a >= 0.5) ? %s(%s) : %s(%s))",
-                               caster, mstring_get_str(cd), caster, mstring_get_str(ab));
+        muxsum = mstring_from_fmt("((%s) ? %s(%s) : %s(%s))",
+                                  (ps->flags & PS_COMBINERCOUNT_MUX_MSB) ?
+                                      "r0.a >= 0.5" :
+                                      "(uint(r0.a * 255.0) & 1u) == 1u",
+                                  caster, mstring_get_str(cd), caster,
+                                  mstring_get_str(ab));
     }
 
-    MString *sum_mapping = get_output(sum, output.mapping);
-    if (mstring_get_length(sum_dest)) {
-        mstring_append_fmt(ps->code, "%s.%s = clamp(%s(%s), -1.0, 1.0);\n",
-                           mstring_get_str(sum_dest), write_mask, caster, mstring_get_str(sum_mapping));
+    MString *muxsum_mapping = get_output(muxsum, output.mapping);
+    if (mstring_get_length(muxsum_dest)) {
+        mstring_append_fmt(ps->code, "mux_sum.%s = clamp(%s(%s), -1.0, 1.0);\n",
+                           write_mask, caster, mstring_get_str(muxsum_mapping));
+        assign_muxsum = true;
+    }
+
+    if (assign_ab) {
+        mstring_append_fmt(ps->code, "%s.%s = ab.%s;\n",
+                           mstring_get_str(ab_dest), write_mask, write_mask);
+
+        if (!is_alpha && output.flags & PS_COMBINEROUTPUT_AB_BLUE_TO_ALPHA) {
+            mstring_append_fmt(ps->code, "%s.a = ab.b;\n",
+                               mstring_get_str(ab_dest));
+        }
+    }
+    if (assign_cd) {
+        mstring_append_fmt(ps->code, "%s.%s = cd.%s;\n",
+                           mstring_get_str(cd_dest), write_mask, write_mask);
+
+        if (!is_alpha && output.flags & PS_COMBINEROUTPUT_CD_BLUE_TO_ALPHA) {
+            mstring_append_fmt(ps->code, "%s.a = cd.b;\n",
+                               mstring_get_str(cd_dest));
+        }
+    }
+    if (assign_muxsum) {
+        mstring_append_fmt(ps->code, "%s.%s = mux_sum.%s;\n",
+                           mstring_get_str(muxsum_dest), write_mask, write_mask);
     }
 
     mstring_unref(a);
@@ -489,9 +525,9 @@ static void add_stage_code(struct PixelShader *ps,
     mstring_unref(cd_mapping);
     mstring_unref(ab_dest);
     mstring_unref(cd_dest);
-    mstring_unref(sum_dest);
-    mstring_unref(sum);
-    mstring_unref(sum_mapping);
+    mstring_unref(muxsum_dest);
+    mstring_unref(muxsum);
+    mstring_unref(muxsum_mapping);
 }
 
 // Add code for the final combiner stage
@@ -616,10 +652,12 @@ static MString* psh_convert(struct PixelShader *ps)
     if (!ps->state.window_clip_exclusive) {
         mstring_append(clip, "bool clipContained = false;\n");
     }
-    mstring_append(clip, "for (int i = 0; i < 8; i++) {\n"
-                         "  bvec4 clipTest = bvec4(lessThan(gl_FragCoord.xy-0.5, clipRegion[i].xy),\n"
-                         "                         greaterThan(gl_FragCoord.xy-0.5, clipRegion[i].zw));\n"
-                         "  if (!any(clipTest)) {\n");
+    mstring_append(clip, "vec2 coord = gl_FragCoord.xy - 0.5;\n"
+                         "for (int i = 0; i < 8; i++) {\n"
+                         "  bool outside = any(bvec4(\n"
+                         "      lessThan(coord, vec2(clipRegion[i].xy)),\n"
+                         "      greaterThan(coord, vec2(clipRegion[i].zw))));\n"
+                         "  if (!outside) {\n");
     if (ps->state.window_clip_exclusive) {
         mstring_append(clip, "    discard;\n");
     } else {
@@ -653,6 +691,9 @@ static MString* psh_convert(struct PixelShader *ps)
     mstring_append(vars, "\n");
     mstring_append(vars, "vec4 v0 = pD0;\n");
     mstring_append(vars, "vec4 v1 = pD1;\n");
+    mstring_append(vars, "vec4 ab;\n");
+    mstring_append(vars, "vec4 cd;\n");
+    mstring_append(vars, "vec4 mux_sum;\n");
 
     ps->code = mstring_new();
 

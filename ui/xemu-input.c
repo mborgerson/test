@@ -44,31 +44,64 @@
 #endif
 
 #define XEMU_INPUT_MIN_INPUT_UPDATE_INTERVAL_US  2500
-#define XEMU_INPUT_MIN_HAPTIC_UPDATE_INTERVAL_US 2500
+#define XEMU_INPUT_MIN_RUMBLE_UPDATE_INTERVAL_US 2500
+
+#if 0
+static void xemu_input_print_controller_state(ControllerState *state)
+{
+    DPRINTF("     A = %d,      B = %d,     X = %d,     Y = %d\n"
+           "  Left = %d,     Up = %d, Right = %d,  Down = %d\n"
+           "  Back = %d,  Start = %d, White = %d, Black = %d\n"
+           "Lstick = %d, Rstick = %d, Guide = %d\n"
+           "\n"
+           "LTrig   = %.3f, RTrig   = %.3f\n"
+           "LStickX = %.3f, RStickX = %.3f\n"
+           "LStickY = %.3f, RStickY = %.3f\n\n",
+        !!(state->buttons & CONTROLLER_BUTTON_A),
+        !!(state->buttons & CONTROLLER_BUTTON_B),
+        !!(state->buttons & CONTROLLER_BUTTON_X),
+        !!(state->buttons & CONTROLLER_BUTTON_Y),
+        !!(state->buttons & CONTROLLER_BUTTON_DPAD_LEFT),
+        !!(state->buttons & CONTROLLER_BUTTON_DPAD_UP),
+        !!(state->buttons & CONTROLLER_BUTTON_DPAD_RIGHT),
+        !!(state->buttons & CONTROLLER_BUTTON_DPAD_DOWN),
+        !!(state->buttons & CONTROLLER_BUTTON_BACK),
+        !!(state->buttons & CONTROLLER_BUTTON_START),
+        !!(state->buttons & CONTROLLER_BUTTON_WHITE),
+        !!(state->buttons & CONTROLLER_BUTTON_BLACK),
+        !!(state->buttons & CONTROLLER_BUTTON_LSTICK),
+        !!(state->buttons & CONTROLLER_BUTTON_RSTICK),
+        !!(state->buttons & CONTROLLER_BUTTON_GUIDE),
+        state->axis[CONTROLLER_AXIS_LTRIG],
+        state->axis[CONTROLLER_AXIS_RTRIG],
+        state->axis[CONTROLLER_AXIS_LSTICK_X],
+        state->axis[CONTROLLER_AXIS_RSTICK_X],
+        state->axis[CONTROLLER_AXIS_LSTICK_Y],
+        state->axis[CONTROLLER_AXIS_RSTICK_Y]
+        );
+}
+#endif
 
 ControllerStateList available_controllers =
     QTAILQ_HEAD_INITIALIZER(available_controllers);
 ControllerState *bound_controllers[4] = { NULL, NULL, NULL, NULL };
 int test_mode;
 
-static const enum xemu_settings_keys port_index_to_settings_key_map[] = {
-    XEMU_SETTINGS_INPUT_CONTROLLER_1_GUID,
-    XEMU_SETTINGS_INPUT_CONTROLLER_2_GUID,
-    XEMU_SETTINGS_INPUT_CONTROLLER_3_GUID,
-    XEMU_SETTINGS_INPUT_CONTROLLER_4_GUID,
+static const char **port_index_to_settings_key_map[] = {
+    &g_config.input.bindings.port1,
+    &g_config.input.bindings.port2,
+    &g_config.input.bindings.port3,
+    &g_config.input.bindings.port4,
 };
 
 void xemu_input_init(void)
 {
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    if (g_config.input.background_input_capture) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    }
 
     if (SDL_Init(SDL_INIT_GAMECONTROLLER) < 0) {
         fprintf(stderr, "Failed to initialize SDL gamecontroller subsystem: %s\n", SDL_GetError());
-        exit(1);
-    }
-
-    if (SDL_Init(SDL_INIT_HAPTIC) < 0) {
-        fprintf(stderr, "Failed to initialize SDL haptic subsystem: %s\n", SDL_GetError());
         exit(1);
     }
 
@@ -110,9 +143,7 @@ int xemu_input_get_controller_default_bind_port(ControllerState *state, int star
     }
 
     for (int i = start; i < 4; i++) {
-        const char *this_port;
-        xemu_settings_get_string(port_index_to_settings_key_map[i], &this_port);
-        if (strcmp(guid, this_port) == 0) {
+        if (strcmp(guid, *port_index_to_settings_key_map[i]) == 0) {
             return i;
         }
     }
@@ -138,12 +169,11 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
         memset(new_con, 0, sizeof(ControllerState));
         new_con->type                 = INPUT_DEVICE_SDL_GAMECONTROLLER;
         new_con->name                 = SDL_GameControllerName(sdl_con);
+        new_con->rumble_enabled       = true;
         new_con->sdl_gamecontroller   = sdl_con;
         new_con->sdl_joystick         = SDL_GameControllerGetJoystick(new_con->sdl_gamecontroller);
         new_con->sdl_joystick_id      = SDL_JoystickInstanceID(new_con->sdl_joystick);
         new_con->sdl_joystick_guid    = SDL_JoystickGetGUID(new_con->sdl_joystick);
-        new_con->sdl_haptic           = SDL_HapticOpenFromJoystick(new_con->sdl_joystick);
-        new_con->sdl_haptic_effect_id = -1;
         new_con->bound                = -1;
 
         char guid_buf[35] = { 0 };
@@ -163,25 +193,42 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
         // upside in this case is that a person can use the same GUID on all
         // ports and just needs to bind to the receiver and never needs to hit
         // this dialog.
+
+
+        // Attempt to re-bind to port previously bound to
         int port = 0;
-        while (1) {
+        bool did_bind = false;
+        while (!did_bind) {
             port = xemu_input_get_controller_default_bind_port(new_con, port);
             if (port < 0) {
                 // No (additional) default mappings
                 break;
-            }
-            if (xemu_input_get_bound(port) != NULL) {
-                // Something already bound here, try again for another port
+            } else if (!xemu_input_get_bound(port)) {
+                xemu_input_bind(port, new_con, 0);
+                did_bind = true;
+                break;
+            } else {
+                // Try again for another port
                 port++;
-                continue;
             }
-            xemu_input_bind(port, new_con, 0);
+        }
+
+        // Try to bind to any open port, and if so remember the binding
+        if (!did_bind && g_config.input.auto_bind) {
+            for (port = 0; port < 4; port++) {
+                if (!xemu_input_get_bound(port)) {
+                    xemu_input_bind(port, new_con, 1);
+                    did_bind = true;
+                    break;
+                }
+            }
+        }
+
+        if (did_bind) {
             char buf[128];
             snprintf(buf, sizeof(buf), "Connected '%s' to port %d", new_con->name, port+1);
             xemu_queue_notification(buf);
-            break;
         }
-
     } else if (event->type == SDL_CONTROLLERDEVICEREMOVED) {
         DPRINTF("Controller Removed: %d\n", event->cdevice.which);
         int handled = 0;
@@ -210,9 +257,6 @@ void xemu_input_process_sdl_events(const SDL_Event *event)
                 QTAILQ_REMOVE(&available_controllers, iter, entry);
 
                 // Deallocate
-                if (iter->sdl_haptic) {
-                    SDL_HapticClose(iter->sdl_haptic);
-                }
                 if (iter->sdl_gamecontroller) {
                     SDL_GameControllerClose(iter->sdl_gamecontroller);
                 }
@@ -354,34 +398,24 @@ void xemu_input_update_sdl_controller_state(ControllerState *state)
     // FIXME: Check range
     state->axis[CONTROLLER_AXIS_LSTICK_Y] = -1 - state->axis[CONTROLLER_AXIS_LSTICK_Y];
     state->axis[CONTROLLER_AXIS_RSTICK_Y] = -1 - state->axis[CONTROLLER_AXIS_RSTICK_Y];
+
+    // xemu_input_print_controller_state(state);
 }
 
 void xemu_input_update_rumble(ControllerState *state)
 {
-    if (state->sdl_haptic == NULL) {
-        // Haptic not supported for this joystick
+    if (!state->rumble_enabled) {
         return;
     }
 
     int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
-    if (ABS(now - state->last_haptic_updated_ts) <
-        XEMU_INPUT_MIN_HAPTIC_UPDATE_INTERVAL_US) {
+    if (ABS(now - state->last_rumble_updated_ts) <
+        XEMU_INPUT_MIN_RUMBLE_UPDATE_INTERVAL_US) {
         return;
     }
 
-    memset(&state->sdl_haptic_effect, 0, sizeof(state->sdl_haptic_effect));
-    state->sdl_haptic_effect.type = SDL_HAPTIC_LEFTRIGHT;
-    state->sdl_haptic_effect.leftright.length = SDL_HAPTIC_INFINITY;
-    state->sdl_haptic_effect.leftright.large_magnitude = state->rumble_l >> 1;
-    state->sdl_haptic_effect.leftright.small_magnitude = state->rumble_r >> 1;
-    if (state->sdl_haptic_effect_id == -1) {
-        state->sdl_haptic_effect_id = SDL_HapticNewEffect(state->sdl_haptic, &state->sdl_haptic_effect);
-        SDL_HapticRunEffect(state->sdl_haptic, state->sdl_haptic_effect_id, 1);
-    } else {
-        SDL_HapticUpdateEffect(state->sdl_haptic, state->sdl_haptic_effect_id, &state->sdl_haptic_effect);
-    }
-
-    state->last_haptic_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    SDL_GameControllerRumble(state->sdl_gamecontroller, state->rumble_l, state->rumble_r, 250);
+    state->last_rumble_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 }
 
 ControllerState *xemu_input_get_bound(int index)
@@ -417,7 +451,6 @@ void xemu_input_bind(int index, ControllerState *state, int save)
             }
         }
         xemu_settings_set_string(port_index_to_settings_key_map[index], guid_buf);
-        xemu_settings_save();
     }
 
     // Bind new controller
@@ -475,43 +508,6 @@ void xemu_input_bind(int index, ControllerState *state, int save)
         state->device = usbhub_dev;
     }
 }
-
-#if 0
-static void xemu_input_print_controller_state(ControllerState *state)
-{
-    DPRINTF("     A = %d,      B = %d,     X = %d,     Y = %d\n"
-           "  Left = %d,     Up = %d, Right = %d,  Down = %d\n"
-           "  Back = %d,  Start = %d, White = %d, Black = %d\n"
-           "Lstick = %d, Rstick = %d, Guide = %d\n"
-           "\n"
-           "LTrig   = %.3f, RTrig   = %.3f\n"
-           "LStickX = %.3f, RStickX = %.3f\n"
-           "LStickY = %.3f, RStickY = %.3f\n\n",
-        !!(state->buttons & CONTROLLER_BUTTON_A),
-        !!(state->buttons & CONTROLLER_BUTTON_B),
-        !!(state->buttons & CONTROLLER_BUTTON_X),
-        !!(state->buttons & CONTROLLER_BUTTON_Y),
-        !!(state->buttons & CONTROLLER_BUTTON_DPAD_LEFT),
-        !!(state->buttons & CONTROLLER_BUTTON_DPAD_UP),
-        !!(state->buttons & CONTROLLER_BUTTON_DPAD_RIGHT),
-        !!(state->buttons & CONTROLLER_BUTTON_DPAD_DOWN),
-        !!(state->buttons & CONTROLLER_BUTTON_BACK),
-        !!(state->buttons & CONTROLLER_BUTTON_START),
-        !!(state->buttons & CONTROLLER_BUTTON_WHITE),
-        !!(state->buttons & CONTROLLER_BUTTON_BLACK),
-        !!(state->buttons & CONTROLLER_BUTTON_LSTICK),
-        !!(state->buttons & CONTROLLER_BUTTON_RSTICK),
-        !!(state->buttons & CONTROLLER_BUTTON_GUIDE),
-        state->axis[CONTROLLER_AXIS_LTRIG],
-        state->axis[CONTROLLER_AXIS_RTRIG],
-        state->axis[CONTROLLER_AXIS_LSTICK_X],
-        state->axis[CONTROLLER_AXIS_RSTICK_X],
-        state->axis[CONTROLLER_AXIS_LSTICK_Y],
-        state->axis[CONTROLLER_AXIS_RSTICK_Y]
-        );
-}
-#endif
-
 
 void xemu_input_set_test_mode(int enabled)
 {

@@ -1,7 +1,7 @@
 project('qemu', ['c'], meson_version: '>=0.55.0',
-        default_options: ['warning_level=1', 'c_std=gnu11', 'cpp_std=gnu++11', 'b_colorout=auto'] +
+        default_options: ['warning_level=1', 'c_std=gnu11', 'cpp_std=c++17', 'b_colorout=auto'] +
                          (meson.version().version_compare('>=0.56.0') ? [ 'b_staticpic=false' ] : []),
-        version: run_command('head', meson.source_root() / 'VERSION').stdout().strip())
+        version: run_command('head', meson.source_root() / 'QEMU_VERSION').stdout().strip())
 
 not_found = dependency('', required: false)
 if meson.version().version_compare('>=0.56.0')
@@ -836,6 +836,14 @@ if 'CONFIG_OPENGL' in config_host
   opengl = declare_dependency(compile_args: config_host['OPENGL_CFLAGS'].split(),
                               link_args: config_host['OPENGL_LIBS'].split())
 endif
+
+tomllib = static_library('tomlpp', sources: files('toml.cpp'),
+                         include_directories: 'tomlplusplus')
+toml = declare_dependency(compile_args: ['-DTOML_HEADER_ONLY=0'],
+                          include_directories: 'tomlplusplus',
+                          link_with: tomllib)
+
+genconfig = declare_dependency(include_directories: 'genconfig')
 
 xemu_gtk = declare_dependency(compile_args: config_host['XEMU_GTK_CFLAGS'].split(),
                               link_args: config_host['XEMU_GTK_LIBS'].split())
@@ -2056,8 +2064,20 @@ qemu_version = custom_target('qemu-version.h',
                              build_by_default: true,
                              build_always_stale: true)
 
+genconfig_cmd = [
+  python, files('genconfig/gen_config.py'),
+   meson.source_root() / 'config_spec.yml', 'xemu-config.h'
+]
+
+xemu_config = custom_target('xemu-config.h',
+                            output: 'xemu-config.h',
+                            input: [ files('config_spec.yml') ],
+                            command: genconfig_cmd,
+                            depend_files: files('config_spec.yml'))
+
 genh += qemu_version
 genh += xemu_version
+genh += xemu_config
 
 hxdep = []
 hx_headers = [
@@ -2299,6 +2319,9 @@ endif
 specific_ss.add(files('xemu-xbe.c', 'xemu-version.c'))
 
 common_ss.add(files('cpus-common.c'))
+
+common_ss.add(toml)
+common_ss.add(genconfig)
 
 subdir('softmmu')
 
